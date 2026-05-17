@@ -2,6 +2,7 @@ import * as readline from "node:readline";
 import OpenAI from "openai";
 
 import { executeTool, TOOLS } from "./tools";
+import { TODO } from "./tools/todo";
 
 /*================  CONSTANT CONFIG  ===================*/
 
@@ -12,7 +13,10 @@ const client = new OpenAI({
 });
 const MODEL = Bun.env.MODEL_ID!;
 
-const SYSTEM_PROMPT = `You are a coding agent at ${WORKDIR}. Use tools to solve tasks. Act, don't explain.`;
+const SYSTEM_PROMPT = `You are a coding agent at ${WORKDIR}.
+Use the todo tool for multi-step work.
+Keep exactly one step in_progress when a task has multiple steps.
+Refresh the plan as work advances. Prefer tools over prose.`;
 
 async function agentLoop(
   messages: OpenAI.Chat.ChatCompletionMessageParam[],
@@ -44,6 +48,8 @@ async function agentLoop(
     )
       return;
 
+    let usedTodo = false;
+
     for (const toolCall of assistantMessage.tool_calls) {
       if (toolCall.type !== "function") continue;
 
@@ -61,6 +67,16 @@ async function agentLoop(
         content: toolCallResult,
         tool_call_id: toolCall.id,
       });
+
+      if (toolCall.function.name === "todo") {
+        usedTodo = true;
+      }
+    }
+    if (usedTodo) TODO.state.roundsSinceUpdate = 0;
+    else {
+      TODO.noteRoundWithoutUpdate();
+      const reminder = TODO.reminder();
+      if (reminder) messages.push({ role: "user", content: reminder });
     }
   }
 }

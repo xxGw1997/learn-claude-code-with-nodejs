@@ -4,6 +4,7 @@ import { spawn } from "child_process";
 import { z } from "zod";
 import { WORKDIR } from "..";
 import type OpenAI from "openai";
+import { todo, TodoArgsSchema } from "./todo";
 
 const BashArgsSchema = z
   .object({
@@ -38,6 +39,7 @@ const TOOL_SCHEMAS = {
   runRead: ReadFileArgsSchema,
   runWrite: WriteFileArgsSchema,
   runEdit: EditFileArgsSchema,
+  todo: TodoArgsSchema,
 } as const;
 
 function safePath(pathStr: string): string {
@@ -157,7 +159,16 @@ export const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
   genTool("runRead", "Read file contents.", TOOL_SCHEMAS.runRead),
   genTool("runWrite", "Run a shell command.", TOOL_SCHEMAS.runWrite),
   genTool("runEdit", "Run a shell command.", TOOL_SCHEMAS.runEdit),
+  genTool(
+    "todo",
+    "Rewrite the current session plan for multi-step work.",
+    TOOL_SCHEMAS.todo,
+  ),
 ];
+
+function genInvalidArgsError(name: string, message: string) {
+  return `Error: Invalid arguments for ${name}: ${message}`;
+}
 
 export async function executeTool(
   name: string,
@@ -168,13 +179,13 @@ export async function executeTool(
     case "runBash": {
       const parsed = TOOL_SCHEMAS.runBash.safeParse(args);
       if (!parsed.success)
-        return `Error: Invalid arguments for ${name}: ${parsed.error.message}`;
+        return genInvalidArgsError(name, parsed.error.message);
       return await toolHandler.runBash(parsed.data.command);
     }
     case "runRead": {
       const parsed = TOOL_SCHEMAS.runRead.safeParse(args);
       if (!parsed.success)
-        return `Error: Invalid arguments for ${name}: ${parsed.error.message}`;
+        return genInvalidArgsError(name, parsed.error.message);
       return toolHandler.runRead(
         parsed.data.path,
         toolCallId,
@@ -184,19 +195,27 @@ export async function executeTool(
     case "runWrite": {
       const parsed = TOOL_SCHEMAS.runWrite.safeParse(args);
       if (!parsed.success)
-        return `Error: Invalid arguments for ${name}: ${parsed.error.message}`;
+        return genInvalidArgsError(name, parsed.error.message);
       return toolHandler.runWrite(parsed.data.path, parsed.data.content);
     }
     case "runEdit": {
       const parsed = TOOL_SCHEMAS.runEdit.safeParse(args);
       if (!parsed.success)
-        return `Error: Invalid arguments for ${name}: ${parsed.error.message}`;
+        return genInvalidArgsError(name, parsed.error.message);
       return toolHandler.runEdit(
         parsed.data.path,
         parsed.data.old_text,
         parsed.data.new_text,
       );
     }
+    case "todo": {
+      const parsed = TOOL_SCHEMAS.todo.safeParse(args);
+      if (!parsed.success)
+        return genInvalidArgsError(name, parsed.error.message);
+
+      return todo(parsed.data.items);
+    }
+
     default:
       return `Unknown tool: ${name}`;
   }
