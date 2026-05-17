@@ -4,6 +4,7 @@ import { spawn } from "child_process";
 import { z } from "zod";
 import { WORKDIR } from "..";
 import type OpenAI from "openai";
+import { runSubAgent, RunSubAgentArgsSchema } from "./run-sub-agent";
 
 const BashArgsSchema = z
   .object({
@@ -137,7 +138,7 @@ const toolHandler = {
   },
 } as const;
 
-function genTool<T extends z.ZodType>(
+export function genTool<T extends z.ZodType>(
   name: string,
   description: string,
   schema: T,
@@ -159,6 +160,10 @@ export const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
   genTool("runEdit", "Run a shell command.", TOOL_SCHEMAS.runEdit),
 ];
 
+function genInvalidArgsError(name: string, message: string) {
+  return `Error: Invalid arguments for ${name}: ${message}`;
+}
+
 export async function executeTool(
   name: string,
   args: unknown,
@@ -168,13 +173,13 @@ export async function executeTool(
     case "runBash": {
       const parsed = TOOL_SCHEMAS.runBash.safeParse(args);
       if (!parsed.success)
-        return `Error: Invalid arguments for ${name}: ${parsed.error.message}`;
+        return genInvalidArgsError(name, parsed.error.message);
       return await toolHandler.runBash(parsed.data.command);
     }
     case "runRead": {
       const parsed = TOOL_SCHEMAS.runRead.safeParse(args);
       if (!parsed.success)
-        return `Error: Invalid arguments for ${name}: ${parsed.error.message}`;
+        return genInvalidArgsError(name, parsed.error.message);
       return toolHandler.runRead(
         parsed.data.path,
         toolCallId,
@@ -184,19 +189,29 @@ export async function executeTool(
     case "runWrite": {
       const parsed = TOOL_SCHEMAS.runWrite.safeParse(args);
       if (!parsed.success)
-        return `Error: Invalid arguments for ${name}: ${parsed.error.message}`;
+        return genInvalidArgsError(name, parsed.error.message);
       return toolHandler.runWrite(parsed.data.path, parsed.data.content);
     }
     case "runEdit": {
       const parsed = TOOL_SCHEMAS.runEdit.safeParse(args);
       if (!parsed.success)
-        return `Error: Invalid arguments for ${name}: ${parsed.error.message}`;
+        return genInvalidArgsError(name, parsed.error.message);
+
       return toolHandler.runEdit(
         parsed.data.path,
         parsed.data.old_text,
         parsed.data.new_text,
       );
     }
+    case "runSubAgent": {
+      const parsed = RunSubAgentArgsSchema.safeParse(args);
+      if (!parsed.success)
+        return genInvalidArgsError(name, parsed.error.message);
+
+      console.log(`> subAgent (${parsed.data.description})`);
+      return runSubAgent(parsed.data.prompt);
+    }
+
     default:
       return `Unknown tool: ${name}`;
   }

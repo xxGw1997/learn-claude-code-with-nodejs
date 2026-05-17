@@ -1,258 +1,195 @@
 #!/usr/bin/env bun
+// Harness: context isolation -- protecting the model's clarity of thought.
 /**
- * s03_todo_write.ts - Session Planning with TodoWrite
- * This chapter is about a lightweight session plan, not a durable task graph.
- * The model can rewrite its current plan, keep one active step in focus, and get
- * nudged if it stops refreshing the plan for too many rounds.
+ * s04_subagent.ts - Subagents
+ * Spawn a child agent with fresh messages=[]. The child works in its own
+ * context, sharing the filesystem, then returns only a summary to the parent.
+ *
+ *     Parent agent                     Subagent
+ *     +------------------+             +------------------+
+ *     | messages=[...]   |             | messages=[]      |  <-- fresh
+ *     |                  |  dispatch   |                  |
+ *     | tool: task       | ---------->| while tool_call: |
+ *     |   prompt="..."   |            |   call tools     |
+ *     |   description="" |            |   append results |
+ *     |                  |  summary   |                  |
+ *     |   result = "..." | <--------- | return last text |
+ *     +------------------+             +------------------+
+ *               |
+ *     Parent context stays clean.
+ *     Subagent context is discarded.
+ *
+ * Key insight: "Fresh messages=[] gives context isolation. The parent stays clean."
+ *
+ * Note: Real Claude Code also uses in-process isolation (not OS-level process
+ * forking). The child runs in the same process with a fresh message array and
+ * isolated tool context -- same pattern as this teaching implementation.
+ *
+ *     Comparison with real Claude Code:
+ *     +-------------------+------------------+----------------------------------+
+ *     | Aspect            | This demo        | Real Claude Code                 |
+ *     +-------------------+------------------+----------------------------------+
+ *     | Backend           | in-process only  | 5 backends: in-process, tmux,    |
+ *     |                   |                  | iTerm2, fork, remote             |
+ *     | Context isolation | fresh messages=[]| createSubagentContext() isolates  |
+ *     |                   |                  | ~20 fields (tools, permissions,  |
+ *     |                   |                  | cwd, env, hooks, etc.)           |
+ *     | Tool filtering    | manually curated | resolveAgentTools() filters from |
+ *     |                   |                  | parent pool; allowedTools         |
+ *     |                   |                  | replaces all allow rules         |
+ *     | Agent definition  | hardcoded system | .claude/agents/*.md with YAML    |
+ *     |                   | prompt           | frontmatter (AgentTemplate)      |
+ *     +-------------------+------------------+----------------------------------+
  */
+
 import OpenAI from "openai";
-import * as path from "node:path";
-import { mkdir } from "node:fs/promises";
-import * as readline from "node:readline/promises";
+import { $ } from "bun";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import type {
+  ChatCompletionMessageParam,
+  ChatCompletionMessageToolCall,
+  ChatCompletionTool,
+} from "openai/resources/chat/completions";
 
 const WORKDIR = process.cwd();
+const MODEL = process.env.MODEL_ID;
+
+if (!MODEL) {
+  throw new Error("MODEL_ID is required");
+}
+
 const client = new OpenAI({
-  baseURL: Bun.env.BASE_URL ?? Bun.env.OPENAI_BASE_URL ?? Bun.env.ANTHROPIC_BASE_URL,
-  apiKey:
-    Bun.env.OPENAI_API_KEY ??
-    Bun.env.ANTHROPIC_API_KEY ??
-    Bun.env.ANTHROPIC_AUTH_TOKEN ??
-    "not-needed",
+  baseURL: process.env.OPENAI_BASE_URL,
+  apiKey: process.env.OPENAI_API_KEY ?? process.env.ANTHROPIC_AUTH_TOKEN ?? "dummy-key",
 });
-const MODEL = Bun.env.MODEL_ID!;
-const PLAN_REMINDER_INTERVAL = 3;
-const SYSTEM = `You are a coding agent at ${WORKDIR}.
-Use the todo tool for multi-step work.
-Keep exactly one step in_progress when a task has multiple steps.
-Refresh the plan as work advances. Prefer tools over prose.`;
 
-type PlanStatus = "pending" | "in_progress" | "completed";
+const SYSTEM = `You are a coding agent at ${WORKDIR}. Use the task tool to delegate exploration or subtasks.`;
+const SUBAGENT_SYSTEM = `You are a coding subagent at ${WORKDIR}. Complete the given task, then summarize your findings.`;
 
-type PlanItem = {
-  content: string;
-  status: PlanStatus;
-  activeForm: string;
-};
+type ToolInput = Record<string, unknown>;
+type ToolHandler = (input: ToolInput) => Promise<string> | string;
 
-type PlanningState = {
-  items: PlanItem[];
-  roundsSinceUpdate: number;
-};
+class AgentTemplate {
+  path: string;
+  name: string;
+  config: Record<string, string> = {};
+  systemPrompt = "";
 
-class TodoManager {
-  state: PlanningState = { items: [], roundsSinceUpdate: 0 };
-
-  update(items: unknown): string {
-    if (!Array.isArray(items)) {
-      throw new Error("items must be an array");
-    }
-    if (items.length > 12) {
-      throw new Error("Keep the session plan short (max 12 items)");
-    }
-
-    const normalized: PlanItem[] = [];
-    let inProgressCount = 0;
-
-    items.forEach((rawItem, index) => {
-      if (!isRecord(rawItem)) {
-        throw new Error(`Item ${index}: object required`);
-      }
-
-      const content = String(rawItem.content ?? "").trim();
-      const status = String(rawItem.status ?? "pending").toLowerCase();
-      const activeForm = String(rawItem.activeForm ?? "").trim();
-
-      if (!content) {
-        throw new Error(`Item ${index}: content required`);
-      }
-      if (!isPlanStatus(status)) {
-        throw new Error(`Item ${index}: invalid status '${status}'`);
-      }
-      if (status === "in_progress") {
-        inProgressCount += 1;
-      }
-
-      normalized.push({ content, status, activeForm });
-    });
-
-    if (inProgressCount > 1) {
-      throw new Error("Only one plan item can be in_progress");
-    }
-
-    this.state.items = normalized;
-    this.state.roundsSinceUpdate = 0;
-    return this.render();
+  constructor(path: string) {
+    this.path = path;
+    this.name = path.split(/[\\/]/).pop()?.replace(/\.md$/, "") ?? "agent";
+    this.parse();
   }
 
-  noteRoundWithoutUpdate(): void {
-    this.state.roundsSinceUpdate += 1;
-  }
+  private parse() {
+    const text = readFileSync(this.path, "utf8");
+    const match = text.match(/^---\s*\n([\s\S]*?)\n---\s*\n([\s\S]*)/);
 
-  reminder(): string | null {
-    if (this.state.items.length === 0) return null;
-    if (this.state.roundsSinceUpdate < PLAN_REMINDER_INTERVAL) return null;
-    return "<reminder>Refresh your current plan before continuing.</reminder>";
-  }
-
-  render(): string {
-    if (this.state.items.length === 0) {
-      return "No session plan yet.";
+    if (!match) {
+      this.systemPrompt = text;
+      return;
     }
 
-    const lines = this.state.items.map((item) => {
-      const marker = {
-        pending: "[ ]",
-        in_progress: "[>]",
-        completed: "[x]",
-      }[item.status];
-      let line = `${marker} ${item.content}`;
-      if (item.status === "in_progress" && item.activeForm) {
-        line += ` (${item.activeForm})`;
-      }
-      return line;
-    });
+    for (const line of match[1].split("\n")) {
+      if (!line.includes(":")) continue;
+      const index = line.indexOf(":");
+      const key = line.slice(0, index).trim();
+      const value = line.slice(index + 1).trim();
+      this.config[key] = value;
+    }
 
-    const completed = this.state.items.filter(
-      (item) => item.status === "completed",
-    ).length;
-    lines.push(`\n(${completed}/${this.state.items.length} completed)`);
-    return lines.join("\n");
+    this.systemPrompt = match[2].trim();
+    this.name = this.config.name ?? this.name;
   }
 }
 
-const TODO = new TodoManager();
+function safePath(path: string): string {
+  const fullPath = resolve(WORKDIR, path);
+  const relativePrefix = WORKDIR.endsWith("/") ? WORKDIR : `${WORKDIR}/`;
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isPlanStatus(value: string): value is PlanStatus {
-  return value === "pending" || value === "in_progress" || value === "completed";
-}
-
-function safePath(pathStr: string): string {
-  const resolved = path.resolve(WORKDIR, pathStr);
-  const relative = path.relative(WORKDIR, resolved);
-  if (relative.startsWith("..") || path.isAbsolute(relative)) {
-    throw new Error(`Path escapes workspace: ${pathStr}`);
+  if (fullPath !== WORKDIR && !fullPath.startsWith(relativePrefix)) {
+    throw new Error(`Path escapes workspace: ${path}`);
   }
-  return resolved;
+
+  return fullPath;
 }
 
 async function runBash(command: string): Promise<string> {
   const dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"];
+
   if (dangerous.some((item) => command.includes(item))) {
     return "Error: Dangerous command blocked";
   }
 
   try {
-    const proc = Bun.spawn(["bash", "-lc", command], {
-      cwd: WORKDIR,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const stdout = new Response(proc.stdout).text();
-    const stderr = new Response(proc.stderr).text();
-
-    let timeout: Timer | undefined;
-    const timedOut = new Promise<"timeout">((resolve) => {
-      timeout = setTimeout(() => {
-        proc.kill();
-        resolve("timeout");
-      }, 120_000);
-    });
-
-    const exit = await Promise.race([proc.exited, timedOut]);
-    if (timeout) clearTimeout(timeout);
-    if (exit === "timeout") {
-      await Promise.allSettled([stdout, stderr]);
+    const result = await $`bash -lc ${command}`.cwd(WORKDIR).timeout(120_000).quiet();
+    const output = `${result.stdout.toString()}${result.stderr.toString()}`.trim();
+    return output ? output.slice(0, 50_000) : "(no output)";
+  } catch (error) {
+    if (error instanceof Error && error.message.toLowerCase().includes("timeout")) {
       return "Error: Timeout (120s)";
     }
 
-    const output = ((await stdout) + (await stderr)).trim();
-    return output ? output.slice(0, 50_000) : "(no output)";
-  } catch (error) {
     return `Error: ${error instanceof Error ? error.message : String(error)}`;
   }
 }
 
-async function runRead(filePath: string, limit?: number): Promise<string> {
+function runRead(path: string, limit?: number): string {
   try {
-    const content = await Bun.file(safePath(filePath)).text();
-    let lines = content.length === 0 ? [] : content.split(/\r?\n/);
+    let lines = readFileSync(safePath(path), "utf8").split("\n");
+
     if (limit && limit < lines.length) {
-      lines = lines.slice(0, limit).concat(`... (${lines.length - limit} more lines)`);
+      lines = [...lines.slice(0, limit), `... (${lines.length - limit} more)`];
     }
+
     return lines.join("\n").slice(0, 50_000);
   } catch (error) {
     return `Error: ${error instanceof Error ? error.message : String(error)}`;
   }
 }
 
-async function runWrite(filePath: string, content: string): Promise<string> {
+function runWrite(path: string, content: string): string {
   try {
-    const resolved = safePath(filePath);
-    await mkdir(path.dirname(resolved), { recursive: true });
-    await Bun.write(resolved, content);
-    return `Wrote ${content.length} bytes to ${filePath}`;
+    const filePath = safePath(path);
+    const parent = dirname(filePath);
+
+    if (!existsSync(parent)) {
+      mkdirSync(parent, { recursive: true });
+    }
+
+    writeFileSync(filePath, content);
+    return `Wrote ${Buffer.byteLength(content)} bytes`;
   } catch (error) {
     return `Error: ${error instanceof Error ? error.message : String(error)}`;
   }
 }
 
-async function runEdit(
-  filePath: string,
-  oldText: string,
-  newText: string,
-): Promise<string> {
+function runEdit(path: string, oldText: string, newText: string): string {
   try {
-    const resolved = safePath(filePath);
-    const content = await Bun.file(resolved).text();
+    const filePath = safePath(path);
+    const content = readFileSync(filePath, "utf8");
+
     if (!content.includes(oldText)) {
-      return `Error: Text not found in ${filePath}`;
+      return `Error: Text not found in ${path}`;
     }
-    await Bun.write(resolved, content.replace(oldText, newText));
-    return `Edited ${filePath}`;
+
+    writeFileSync(filePath, content.replace(oldText, newText));
+    return `Edited ${path}`;
   } catch (error) {
     return `Error: ${error instanceof Error ? error.message : String(error)}`;
   }
 }
 
-async function executeTool(
-  name: string,
-  args: Record<string, unknown>,
-): Promise<string> {
-  switch (name) {
-    case "bash": {
-      if (typeof args.command !== "string") return "Error: command required";
-      return await runBash(args.command);
-    }
-    case "read_file": {
-      if (typeof args.path !== "string") return "Error: path required";
-      if (args.limit !== undefined && typeof args.limit !== "number") {
-        return "Error: limit must be a number";
-      }
-      return await runRead(args.path, args.limit);
-    }
-    case "write_file": {
-      if (typeof args.path !== "string") return "Error: path required";
-      if (typeof args.content !== "string") return "Error: content required";
-      return await runWrite(args.path, args.content);
-    }
-    case "edit_file": {
-      if (typeof args.path !== "string") return "Error: path required";
-      if (typeof args.old_text !== "string") return "Error: old_text required";
-      if (typeof args.new_text !== "string") return "Error: new_text required";
-      return await runEdit(args.path, args.old_text, args.new_text);
-    }
-    case "todo":
-      return TODO.update(args.items);
-    default:
-      return `Unknown tool: ${name}`;
-  }
-}
+const TOOL_HANDLERS: Record<string, ToolHandler> = {
+  bash: (input) => runBash(String(input.command)),
+  read_file: (input) => runRead(String(input.path), input.limit == null ? undefined : Number(input.limit)),
+  write_file: (input) => runWrite(String(input.path), String(input.content)),
+  edit_file: (input) => runEdit(String(input.path), String(input.old_text), String(input.new_text)),
+};
 
-const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
+const CHILD_TOOLS: ChatCompletionTool[] = [
   {
     type: "function",
     function: {
@@ -272,10 +209,7 @@ const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
       description: "Read file contents.",
       parameters: {
         type: "object",
-        properties: {
-          path: { type: "string" },
-          limit: { type: "integer" },
-        },
+        properties: { path: { type: "string" }, limit: { type: "integer" } },
         required: ["path"],
       },
     },
@@ -284,13 +218,10 @@ const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
     type: "function",
     function: {
       name: "write_file",
-      description: "Write content to a file.",
+      description: "Write content to file.",
       parameters: {
         type: "object",
-        properties: {
-          path: { type: "string" },
-          content: { type: "string" },
-        },
+        properties: { path: { type: "string" }, content: { type: "string" } },
         required: ["path", "content"],
       },
     },
@@ -299,7 +230,7 @@ const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
     type: "function",
     function: {
       name: "edit_file",
-      description: "Replace exact text in a file once.",
+      description: "Replace exact text in file.",
       parameters: {
         type: "object",
         properties: {
@@ -311,148 +242,136 @@ const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
       },
     },
   },
+];
+
+const PARENT_TOOLS: ChatCompletionTool[] = [
+  ...CHILD_TOOLS,
   {
     type: "function",
     function: {
-      name: "todo",
-      description: "Rewrite the current session plan for multi-step work.",
+      name: "task",
+      description: "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
       parameters: {
         type: "object",
         properties: {
-          items: {
-            type: "array",
-            items: {
-              type: "object",
-              properties: {
-                content: { type: "string" },
-                status: {
-                  type: "string",
-                  enum: ["pending", "in_progress", "completed"],
-                },
-                activeForm: {
-                  type: "string",
-                  description: "Optional present-continuous label.",
-                },
-              },
-              required: ["content", "status"],
-            },
-          },
+          prompt: { type: "string" },
+          description: { type: "string", description: "Short description of the task" },
         },
-        required: ["items"],
+        required: ["prompt"],
       },
     },
   },
 ];
 
-function extractText(message: OpenAI.Chat.ChatCompletionMessageParam | undefined): string {
-  if (!message || message.role !== "assistant") return "";
-  const content = message.content;
-  if (typeof content === "string") return content.trim();
-  if (!Array.isArray(content)) return "";
-  return content
-    .map((block) => (block.type === "text" ? block.text : ""))
-    .join("\n")
-    .trim();
-}
-
-function parseToolArguments(argumentsText: string): Record<string, unknown> {
-  const parsed = JSON.parse(argumentsText || "{}");
-  if (!isRecord(parsed)) {
-    throw new Error("Tool arguments must be a JSON object");
+function parseToolArguments(toolCall: ChatCompletionMessageToolCall): ToolInput {
+  try {
+    return JSON.parse(toolCall.function.arguments || "{}");
+  } catch {
+    return {};
   }
-  return parsed;
 }
 
-async function agentLoop(
-  messages: OpenAI.Chat.ChatCompletionMessageParam[],
-): Promise<void> {
+async function runSubagent(prompt: string): Promise<string> {
+  const subMessages: ChatCompletionMessageParam[] = [
+    { role: "system", content: SUBAGENT_SYSTEM },
+    { role: "user", content: prompt },
+  ];
+
+  let finalContent = "";
+
+  for (let i = 0; i < 30; i++) {
+    const response = await client.chat.completions.create({
+      model: MODEL,
+      messages: subMessages,
+      tools: CHILD_TOOLS,
+      max_tokens: 8000,
+    });
+
+    const message = response.choices[0].message;
+    subMessages.push(message);
+
+    if (!message.tool_calls?.length) {
+      finalContent = message.content ?? "";
+      break;
+    }
+
+    for (const toolCall of message.tool_calls) {
+      const handler = TOOL_HANDLERS[toolCall.function.name];
+      const output = handler
+        ? await handler(parseToolArguments(toolCall))
+        : `Unknown tool: ${toolCall.function.name}`;
+
+      subMessages.push({
+        role: "tool",
+        tool_call_id: toolCall.id,
+        content: String(output).slice(0, 50_000),
+      });
+    }
+  }
+
+  return finalContent || "(no summary)";
+}
+
+async function agentLoop(messages: ChatCompletionMessageParam[]) {
   while (true) {
     const response = await client.chat.completions.create({
       model: MODEL,
       messages: [{ role: "system", content: SYSTEM }, ...messages],
-      tools: TOOLS,
-      max_completion_tokens: 8000,
+      tools: PARENT_TOOLS,
+      max_tokens: 8000,
     });
 
-    const assistantMessage = response.choices[0]?.message;
-    if (!assistantMessage) return;
+    const message = response.choices[0].message;
+    messages.push(message);
 
-    messages.push({
-      role: "assistant",
-      content: assistantMessage.content ?? null,
-      tool_calls: assistantMessage.tool_calls,
-    });
-
-    const toolCalls = assistantMessage.tool_calls ?? [];
-    if (response.choices[0]?.finish_reason !== "tool_calls" || toolCalls.length === 0) {
+    if (!message.tool_calls?.length) {
       return;
     }
 
-    let usedTodo = false;
-    for (const toolCall of toolCalls) {
-      if (toolCall.type !== "function") continue;
-
+    for (const toolCall of message.tool_calls) {
+      const input = parseToolArguments(toolCall);
       let output: string;
-      try {
-        output = await executeTool(
-          toolCall.function.name,
-          parseToolArguments(toolCall.function.arguments),
-        );
-      } catch (error) {
-        output = `Error: ${error instanceof Error ? error.message : String(error)}`;
+
+      if (toolCall.function.name === "task") {
+        const description = String(input.description ?? "subtask");
+        const prompt = String(input.prompt ?? "");
+        console.log(`> task (${description}): ${prompt.slice(0, 80)}`);
+        output = await runSubagent(prompt);
+      } else {
+        const handler = TOOL_HANDLERS[toolCall.function.name];
+        output = handler ? await handler(input) : `Unknown tool: ${toolCall.function.name}`;
       }
 
-      console.log(`> ${toolCall.function.name}: ${output.slice(0, 200)}`);
-      messages.push({
-        role: "tool",
-        tool_call_id: toolCall.id,
-        content: output,
-      });
-
-      if (toolCall.function.name === "todo") {
-        usedTodo = true;
-      }
-    }
-
-    if (usedTodo) {
-      TODO.state.roundsSinceUpdate = 0;
-    } else {
-      TODO.noteRoundWithoutUpdate();
-      const reminder = TODO.reminder();
-      if (reminder) {
-        messages.push({ role: "user", content: reminder });
-      }
+      console.log(`  ${String(output).slice(0, 200)}`);
+      messages.push({ role: "tool", tool_call_id: toolCall.id, content: String(output) });
     }
   }
 }
 
-async function main(): Promise<void> {
-  const history: OpenAI.Chat.ChatCompletionMessageParam[] = [];
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+async function main() {
+  const history: ChatCompletionMessageParam[] = [];
 
   while (true) {
-    let query: string;
-    try {
-      query = await rl.question("\x1b[36ms03 >> \x1b[0m");
-    } catch {
-      break;
-    }
+    const query = prompt("\x1b[36ms04 >> \x1b[0m");
 
-    if (["q", "exit", ""].includes(query.trim().toLowerCase())) {
+    if (!query || ["q", "exit"].includes(query.trim().toLowerCase())) {
       break;
     }
 
     history.push({ role: "user", content: query });
     await agentLoop(history);
 
-    const finalText = extractText(history.at(-1));
-    if (finalText) {
-      console.log(finalText);
+    const responseContent = history.at(-1);
+    if (responseContent?.role === "assistant" && typeof responseContent.content === "string") {
+      console.log(responseContent.content);
     }
+
     console.log();
   }
-
-  rl.close();
 }
 
-await main();
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  await main();
+}
+
+export { AgentTemplate, agentLoop, runSubagent };

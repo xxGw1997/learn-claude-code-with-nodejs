@@ -2,17 +2,19 @@ import * as readline from "node:readline";
 import OpenAI from "openai";
 
 import { executeTool, TOOLS } from "./tools";
+import { runSubAgentTool } from "./tools/run-sub-agent";
 
 /*================  CONSTANT CONFIG  ===================*/
 
 export const WORKDIR = process.cwd();
-const client = new OpenAI({
+export const client = new OpenAI({
   baseURL: Bun.env.BASE_URL!,
   apiKey: Bun.env.ANTHROPIC_API_KEY!,
 });
-const MODEL = Bun.env.MODEL_ID!;
+export const MODEL = Bun.env.MODEL_ID!;
 
-const SYSTEM_PROMPT = `You are a coding agent at ${WORKDIR}. Use tools to solve tasks. Act, don't explain.`;
+const SYSTEM_PROMPT = `You are a coding agent at ${WORKDIR}. Use the task tool to delegate exploration or subtasks.`;
+export const SUBAGENT_SYSTEM = `You are a coding subagent at ${WORKDIR}. Complete the given task, then summarize your findings.`;
 
 async function agentLoop(
   messages: OpenAI.Chat.ChatCompletionMessageParam[],
@@ -21,7 +23,7 @@ async function agentLoop(
     const response = await client.chat.completions.create({
       model: MODEL!,
       messages: [{ role: "system", content: SYSTEM_PROMPT }, ...messages],
-      tools: TOOLS,
+      tools: [...TOOLS, runSubAgentTool],
     });
 
     const choice = response.choices[0];
