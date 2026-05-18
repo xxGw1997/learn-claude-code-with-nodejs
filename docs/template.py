@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-# Harness: planning -- keep the current session plan outside the model's head.
+# Harness: on-demand knowledge -- discover skills cheaply, load them only when needed.
 """
-s03_todo_write.py - Session Planning with TodoWrite
-This chapter is about a lightweight session plan, not a durable task graph.
-The model can rewrite its current plan, keep one active step in focus, and get
-nudged if it stops refreshing the plan for too many rounds.
+s05_skill_loading.py - Skills
+This chapter teaches a two-layer skill model:
+1. Put a cheap skill catalog in the system prompt.
+2. Load the full skill body only when the model asks for it.
+That keeps the prompt small while still giving the model access to reusable,
+task-specific guidance.
 """
 import os
+import re
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from anthropic import Anthropic
 from dotenv import load_dotenv
@@ -18,74 +21,65 @@ if os.getenv("ANTHROPIC_BASE_URL"):
 WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
-PLAN_REMINDER_INTERVAL = 3
-SYSTEM = f"""You are a coding agent at {WORKDIR}.
-Use the todo tool for multi-step work.
-Keep exactly one step in_progress when a task has multiple steps.
-Refresh the plan as work advances. Prefer tools over prose."""
+SKILLS_DIR = WORKDIR / "skills"
 @dataclass
-class PlanItem:
-    content: str
-    status: str = "pending"
-    active_form: str = ""
+class SkillManifest:
+    name: str
+    description: str
+    path: Path
 @dataclass
-class PlanningState:
-    items: list[PlanItem] = field(default_factory=list)
-    rounds_since_update: int = 0
-class TodoManager:
-    def __init__(self):
-        self.state = PlanningState()
-    def update(self, items: list) -> str:
-        if len(items) > 12:
-            raise ValueError("Keep the session plan short (max 12 items)")
-        normalized = []
-        in_progress_count = 0
-        for index, raw_item in enumerate(items):
-            content = str(raw_item.get("content", "")).strip()
-            status = str(raw_item.get("status", "pending")).lower()
-            active_form = str(raw_item.get("activeForm", "")).strip()
-            if not content:
-                raise ValueError(f"Item {index}: content required")
-            if status not in {"pending", "in_progress", "completed"}:
-                raise ValueError(f"Item {index}: invalid status '{status}'")
-            if status == "in_progress":
-                in_progress_count += 1
-            normalized.append(PlanItem(
-                content=content,
-                status=status,
-                active_form=active_form,
-            ))
-        if in_progress_count > 1:
-            raise ValueError("Only one plan item can be in_progress")
-        self.state.items = normalized
-        self.state.rounds_since_update = 0
-        return self.render()
-    def note_round_without_update(self) -> None:
-        self.state.rounds_since_update += 1
-    def reminder(self) -> str | None:
-        if not self.state.items:
-            return None
-        if self.state.rounds_since_update < PLAN_REMINDER_INTERVAL:
-            return None
-        return "<reminder>Refresh your current plan before continuing.</reminder>"
-    def render(self) -> str:
-        if not self.state.items:
-            return "No session plan yet."
+class SkillDocument:
+    manifest: SkillManifest
+    body: str
+class SkillRegistry:
+    def __init__(self, skills_dir: Path):
+        self.skills_dir = skills_dir
+        self.documents: dict[str, SkillDocument] = {}
+        self._load_all()
+    def _load_all(self) -> None:
+        if not self.skills_dir.exists():
+            return
+        for path in sorted(self.skills_dir.rglob("SKILL.md")):
+            meta, body = self._parse_frontmatter(path.read_text())
+            name = meta.get("name", path.parent.name)
+            description = meta.get("description", "No description")
+            manifest = SkillManifest(name=name, description=description, path=path)
+            self.documents[name] = SkillDocument(manifest=manifest, body=body.strip())
+    def _parse_frontmatter(self, text: str) -> tuple[dict, str]:
+        match = re.match(r"^---\n(.*?)\n---\n(.*)", text, re.DOTALL)
+        if not match:
+            return {}, text
+        meta = {}
+        for line in match.group(1).strip().splitlines():
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            meta[key.strip()] = value.strip()
+        return meta, match.group(2)
+    def describe_available(self) -> str:
+        if not self.documents:
+            return "(no skills available)"
         lines = []
-        for item in self.state.items:
-            marker = {
-                "pending": "[ ]",
-                "in_progress": "[>]",
-                "completed": "[x]",
-            }[item.status]
-            line = f"{marker} {item.content}"
-            if item.status == "in_progress" and item.active_form:
-                line += f" ({item.active_form})"
-            lines.append(line)
-        completed = sum(1 for item in self.state.items if item.status == "completed")
-        lines.append(f"\n({completed}/{len(self.state.items)} completed)")
+        for name in sorted(self.documents):
+            manifest = self.documents[name].manifest
+            lines.append(f"- {manifest.name}: {manifest.description}")
         return "\n".join(lines)
-TODO = TodoManager()
+    def load_full_text(self, name: str) -> str:
+        document = self.documents.get(name)
+        if not document:
+            known = ", ".join(sorted(self.documents)) or "(none)"
+            return f"Error: Unknown skill '{name}'. Available skills: {known}"
+        return (
+            f"<skill name=\"{document.manifest.name}\">\n"
+            f"{document.body}\n"
+            "</skill>"
+        )
+SKILL_REGISTRY = SkillRegistry(SKILLS_DIR)
+SYSTEM = f"""You are a coding agent at {WORKDIR}.
+Use load_skill when a task needs specialized instructions before you act.
+Skills available:
+{SKILL_REGISTRY.describe_available()}
+"""
 def safe_path(path_str: str) -> Path:
     path = (WORKDIR / path_str).resolve()
     if not path.is_relative_to(WORKDIR):
@@ -139,7 +133,7 @@ TOOL_HANDLERS = {
     "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
-    "todo": lambda **kw: TODO.update(kw["items"]),
+    "load_skill": lambda **kw: SKILL_REGISTRY.load_full_text(kw["name"]),
 }
 TOOLS = [
     {
@@ -189,31 +183,12 @@ TOOLS = [
         },
     },
     {
-        "name": "todo",
-        "description": "Rewrite the current session plan for multi-step work.",
+        "name": "load_skill",
+        "description": "Load the full body of a named skill into the current context.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "items": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "content": {"type": "string"},
-                            "status": {
-                                "type": "string",
-                                "enum": ["pending", "in_progress", "completed"],
-                            },
-                            "activeForm": {
-                                "type": "string",
-                                "description": "Optional present-continuous label.",
-                            },
-                        },
-                        "required": ["content", "status"],
-                    },
-                },
-            },
-            "required": ["items"],
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
         },
     },
 ]
@@ -239,7 +214,6 @@ def agent_loop(messages: list) -> None:
         if response.stop_reason != "tool_use":
             return
         results = []
-        used_todo = False
         for block in response.content:
             if block.type != "tool_use":
                 continue
@@ -254,21 +228,12 @@ def agent_loop(messages: list) -> None:
                 "tool_use_id": block.id,
                 "content": str(output),
             })
-            if block.name == "todo":
-                used_todo = True
-        if used_todo:
-            TODO.state.rounds_since_update = 0
-        else:
-            TODO.note_round_without_update()
-            reminder = TODO.reminder()
-            if reminder:
-                results.insert(0, {"type": "text", "text": reminder})
         messages.append({"role": "user", "content": results})
 if __name__ == "__main__":
     history = []
     while True:
         try:
-            query = input("\033[36ms03 >> \033[0m")
+            query = input("\033[36ms05 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):

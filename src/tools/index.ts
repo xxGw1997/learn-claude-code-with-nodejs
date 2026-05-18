@@ -2,8 +2,9 @@ import * as fs from "fs";
 import * as path from "path";
 import { spawn } from "child_process";
 import { z } from "zod";
-import { WORKDIR } from "..";
+import { WORKDIR } from "../config";
 import type OpenAI from "openai";
+import { SKILL_REGISTRY } from "./skills";
 
 const BashArgsSchema = z
   .object({
@@ -33,11 +34,18 @@ const EditFileArgsSchema = z
   })
   .strict();
 
+const LoadSkillArgsSchema = z
+  .object({
+    name: z.string().describe("Skill name"),
+  })
+  .strict();
+
 const TOOL_SCHEMAS = {
   runBash: BashArgsSchema,
   runRead: ReadFileArgsSchema,
   runWrite: WriteFileArgsSchema,
   runEdit: EditFileArgsSchema,
+  loadSkill: LoadSkillArgsSchema,
 } as const;
 
 function safePath(pathStr: string): string {
@@ -157,6 +165,11 @@ export const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
   genTool("runRead", "Read file contents.", TOOL_SCHEMAS.runRead),
   genTool("runWrite", "Run a shell command.", TOOL_SCHEMAS.runWrite),
   genTool("runEdit", "Run a shell command.", TOOL_SCHEMAS.runEdit),
+  genTool(
+    "loadSkill",
+    "Load the full body of a named skill into the current context.",
+    TOOL_SCHEMAS.loadSkill,
+  ),
 ];
 
 export async function executeTool(
@@ -196,6 +209,13 @@ export async function executeTool(
         parsed.data.old_text,
         parsed.data.new_text,
       );
+    }
+    case "loadSkill": {
+      const parsed = TOOL_SCHEMAS.loadSkill.safeParse(args);
+      if (!parsed.success)
+        return `Error: Invalid arguments for ${name}: ${parsed.error.message}`;
+      console.log(parsed.data.name)
+      return SKILL_REGISTRY.loadSkillFullText(parsed.data.name);
     }
     default:
       return `Unknown tool: ${name}`;

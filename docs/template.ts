@@ -1,141 +1,149 @@
 #!/usr/bin/env bun
-/**
- * s03_todo_write.ts - Session Planning with TodoWrite
- * This chapter is about a lightweight session plan, not a durable task graph.
- * The model can rewrite its current plan, keep one active step in focus, and get
- * nudged if it stops refreshing the plan for too many rounds.
+// Harness: on-demand knowledge -- discover skills cheaply, load them only when needed.
+/*
+ * s05_skill_loading.ts - Skills
+ *
+ * This chapter teaches a two-layer skill model:
+ * 1. Put a cheap skill catalog in the system prompt.
+ * 2. Load the full skill body only when the model asks for it.
+ *
+ * This TypeScript version uses OpenAI's Chat Completions tool-calling shape:
+ * - Anthropic "input_schema" becomes OpenAI "function.parameters".
+ * - Anthropic "tool_use" content blocks become OpenAI "tool_calls".
+ * - Anthropic "tool_result" user content becomes OpenAI role="tool" messages.
  */
-import OpenAI from "openai";
+import { spawn } from "node:child_process";
+import * as fs from "node:fs";
 import * as path from "node:path";
-import { mkdir } from "node:fs/promises";
-import * as readline from "node:readline/promises";
+import * as readline from "node:readline";
+import OpenAI from "openai";
 
 const WORKDIR = process.cwd();
+const SKILLS_DIR = path.join(WORKDIR, "skills");
+const MODEL = Bun.env.MODEL_ID;
+
+if (!MODEL) {
+  throw new Error("MODEL_ID is required");
+}
+
 const client = new OpenAI({
-  baseURL: Bun.env.BASE_URL ?? Bun.env.OPENAI_BASE_URL ?? Bun.env.ANTHROPIC_BASE_URL,
-  apiKey:
-    Bun.env.OPENAI_API_KEY ??
-    Bun.env.ANTHROPIC_API_KEY ??
-    Bun.env.ANTHROPIC_AUTH_TOKEN ??
-    "not-needed",
+  baseURL: Bun.env.OPENAI_BASE_URL ?? Bun.env.BASE_URL,
+  apiKey: Bun.env.OPENAI_API_KEY ?? Bun.env.ANTHROPIC_API_KEY,
 });
-const MODEL = Bun.env.MODEL_ID!;
-const PLAN_REMINDER_INTERVAL = 3;
-const SYSTEM = `You are a coding agent at ${WORKDIR}.
-Use the todo tool for multi-step work.
-Keep exactly one step in_progress when a task has multiple steps.
-Refresh the plan as work advances. Prefer tools over prose.`;
 
-type PlanStatus = "pending" | "in_progress" | "completed";
+type JsonSchema = Record<string, unknown>;
+type ToolArgs = Record<string, unknown>;
+type ToolHandler = (args: ToolArgs) => string | Promise<string>;
 
-type PlanItem = {
-  content: string;
-  status: PlanStatus;
-  activeForm: string;
-};
+interface SkillManifest {
+  name: string;
+  description: string;
+  path: string;
+}
 
-type PlanningState = {
-  items: PlanItem[];
-  roundsSinceUpdate: number;
-};
+interface SkillDocument {
+  manifest: SkillManifest;
+  body: string;
+}
 
-class TodoManager {
-  state: PlanningState = { items: [], roundsSinceUpdate: 0 };
+class SkillRegistry {
+  private readonly documents = new Map<string, SkillDocument>();
 
-  update(items: unknown): string {
-    if (!Array.isArray(items)) {
-      throw new Error("items must be an array");
-    }
-    if (items.length > 12) {
-      throw new Error("Keep the session plan short (max 12 items)");
-    }
-
-    const normalized: PlanItem[] = [];
-    let inProgressCount = 0;
-
-    items.forEach((rawItem, index) => {
-      if (!isRecord(rawItem)) {
-        throw new Error(`Item ${index}: object required`);
-      }
-
-      const content = String(rawItem.content ?? "").trim();
-      const status = String(rawItem.status ?? "pending").toLowerCase();
-      const activeForm = String(rawItem.activeForm ?? "").trim();
-
-      if (!content) {
-        throw new Error(`Item ${index}: content required`);
-      }
-      if (!isPlanStatus(status)) {
-        throw new Error(`Item ${index}: invalid status '${status}'`);
-      }
-      if (status === "in_progress") {
-        inProgressCount += 1;
-      }
-
-      normalized.push({ content, status, activeForm });
-    });
-
-    if (inProgressCount > 1) {
-      throw new Error("Only one plan item can be in_progress");
-    }
-
-    this.state.items = normalized;
-    this.state.roundsSinceUpdate = 0;
-    return this.render();
+  constructor(private readonly skillsDir: string) {
+    this.loadAll();
   }
 
-  noteRoundWithoutUpdate(): void {
-    this.state.roundsSinceUpdate += 1;
+  describeAvailable(): string {
+    if (this.documents.size === 0) return "(no skills available)";
+
+    return [...this.documents.keys()]
+      .sort()
+      .map((name) => {
+        const manifest = this.documents.get(name)!.manifest;
+        return `- ${manifest.name}: ${manifest.description}`;
+      })
+      .join("\n");
   }
 
-  reminder(): string | null {
-    if (this.state.items.length === 0) return null;
-    if (this.state.roundsSinceUpdate < PLAN_REMINDER_INTERVAL) return null;
-    return "<reminder>Refresh your current plan before continuing.</reminder>";
-  }
-
-  render(): string {
-    if (this.state.items.length === 0) {
-      return "No session plan yet.";
+  loadFullText(name: string): string {
+    const document = this.documents.get(name);
+    if (!document) {
+      const known = [...this.documents.keys()].sort().join(", ") || "(none)";
+      return `Error: Unknown skill '${name}'. Available skills: ${known}`;
     }
 
-    const lines = this.state.items.map((item) => {
-      const marker = {
-        pending: "[ ]",
-        in_progress: "[>]",
-        completed: "[x]",
-      }[item.status];
-      let line = `${marker} ${item.content}`;
-      if (item.status === "in_progress" && item.activeForm) {
-        line += ` (${item.activeForm})`;
-      }
-      return line;
-    });
+    return `<skill name="${document.manifest.name}">\n${document.body}\n</skill>`;
+  }
 
-    const completed = this.state.items.filter(
-      (item) => item.status === "completed",
-    ).length;
-    lines.push(`\n(${completed}/${this.state.items.length} completed)`);
-    return lines.join("\n");
+  private loadAll(): void {
+    if (!fs.existsSync(this.skillsDir)) return;
+
+    for (const skillPath of this.findSkillFiles(this.skillsDir).sort()) {
+      const text = fs.readFileSync(skillPath, "utf8");
+      const { meta, body } = this.parseFrontmatter(text);
+      const name = meta.name ?? path.basename(path.dirname(skillPath));
+      const description = meta.description ?? "No description";
+
+      this.documents.set(name, {
+        manifest: { name, description, path: skillPath },
+        body: body.trim(),
+      });
+    }
+  }
+
+  private findSkillFiles(dir: string): string[] {
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    const files: string[] = [];
+
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        files.push(...this.findSkillFiles(fullPath));
+      } else if (entry.isFile() && entry.name === "SKILL.md") {
+        files.push(fullPath);
+      }
+    }
+
+    return files;
+  }
+
+  private parseFrontmatter(text: string): {
+    meta: Record<string, string>;
+    body: string;
+  } {
+    const match = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/);
+    if (!match) return { meta: {}, body: text };
+
+    const meta: Record<string, string> = {};
+    for (const line of match[1].trim().split(/\r?\n/)) {
+      const separator = line.indexOf(":");
+      if (separator === -1) continue;
+
+      const key = line.slice(0, separator).trim();
+      const value = line.slice(separator + 1).trim();
+      if (key) meta[key] = value;
+    }
+
+    return { meta, body: match[2] };
   }
 }
 
-const TODO = new TodoManager();
+const SKILL_REGISTRY = new SkillRegistry(SKILLS_DIR);
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isPlanStatus(value: string): value is PlanStatus {
-  return value === "pending" || value === "in_progress" || value === "completed";
-}
+const SYSTEM_PROMPT = `You are a coding agent at ${WORKDIR}.
+Use load_skill when a task needs specialized instructions before you act.
+Skills available:
+${SKILL_REGISTRY.describeAvailable()}
+`;
 
 function safePath(pathStr: string): string {
   const resolved = path.resolve(WORKDIR, pathStr);
   const relative = path.relative(WORKDIR, resolved);
+
   if (relative.startsWith("..") || path.isAbsolute(relative)) {
     throw new Error(`Path escapes workspace: ${pathStr}`);
   }
+
   return resolved;
 }
 
@@ -145,222 +153,226 @@ async function runBash(command: string): Promise<string> {
     return "Error: Dangerous command blocked";
   }
 
-  try {
-    const proc = Bun.spawn(["bash", "-lc", command], {
+  return await new Promise((resolve) => {
+    const child = spawn(command, {
+      shell: true,
       cwd: WORKDIR,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const stdout = new Response(proc.stdout).text();
-    const stderr = new Response(proc.stderr).text();
-
-    let timeout: Timer | undefined;
-    const timedOut = new Promise<"timeout">((resolve) => {
-      timeout = setTimeout(() => {
-        proc.kill();
-        resolve("timeout");
-      }, 120_000);
+      timeout: 120_000,
     });
 
-    const exit = await Promise.race([proc.exited, timedOut]);
-    if (timeout) clearTimeout(timeout);
-    if (exit === "timeout") {
-      await Promise.allSettled([stdout, stderr]);
-      return "Error: Timeout (120s)";
-    }
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
 
-    const output = ((await stdout) + (await stderr)).trim();
-    return output ? output.slice(0, 50_000) : "(no output)";
-  } catch (error) {
-    return `Error: ${error instanceof Error ? error.message : String(error)}`;
-  }
+    child.stdout?.on("data", (data) => {
+      stdout += data.toString();
+    });
+
+    child.stderr?.on("data", (data) => {
+      stderr += data.toString();
+    });
+
+    child.on("close", () => {
+      if (settled) return;
+      settled = true;
+
+      const output = (stdout + stderr).trim() || "(no output)";
+      resolve(output.slice(0, 50_000));
+    });
+
+    child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      resolve(`Error: ${error.message}`);
+    });
+  });
 }
 
-async function runRead(filePath: string, limit?: number): Promise<string> {
+function runRead(filePath: string, limit?: number): string {
   try {
-    const content = await Bun.file(safePath(filePath)).text();
-    let lines = content.length === 0 ? [] : content.split(/\r?\n/);
+    let lines = fs.readFileSync(safePath(filePath), "utf8").split(/\r?\n/);
+
     if (limit && limit < lines.length) {
-      lines = lines.slice(0, limit).concat(`... (${lines.length - limit} more lines)`);
+      lines = lines
+        .slice(0, limit)
+        .concat([`... (${lines.length - limit} more lines)`]);
     }
+
     return lines.join("\n").slice(0, 50_000);
   } catch (error) {
     return `Error: ${error instanceof Error ? error.message : String(error)}`;
   }
 }
 
-async function runWrite(filePath: string, content: string): Promise<string> {
+function runWrite(filePath: string, content: string): string {
   try {
     const resolved = safePath(filePath);
-    await mkdir(path.dirname(resolved), { recursive: true });
-    await Bun.write(resolved, content);
+    fs.mkdirSync(path.dirname(resolved), { recursive: true });
+    fs.writeFileSync(resolved, content, "utf8");
     return `Wrote ${content.length} bytes to ${filePath}`;
   } catch (error) {
     return `Error: ${error instanceof Error ? error.message : String(error)}`;
   }
 }
 
-async function runEdit(
-  filePath: string,
-  oldText: string,
-  newText: string,
-): Promise<string> {
+function runEdit(filePath: string, oldText: string, newText: string): string {
   try {
     const resolved = safePath(filePath);
-    const content = await Bun.file(resolved).text();
+    const content = fs.readFileSync(resolved, "utf8");
+
     if (!content.includes(oldText)) {
       return `Error: Text not found in ${filePath}`;
     }
-    await Bun.write(resolved, content.replace(oldText, newText));
+
+    fs.writeFileSync(resolved, content.replace(oldText, newText), "utf8");
     return `Edited ${filePath}`;
   } catch (error) {
     return `Error: ${error instanceof Error ? error.message : String(error)}`;
   }
 }
 
-async function executeTool(
-  name: string,
-  args: Record<string, unknown>,
-): Promise<string> {
-  switch (name) {
-    case "bash": {
-      if (typeof args.command !== "string") return "Error: command required";
-      return await runBash(args.command);
-    }
-    case "read_file": {
-      if (typeof args.path !== "string") return "Error: path required";
-      if (args.limit !== undefined && typeof args.limit !== "number") {
-        return "Error: limit must be a number";
-      }
-      return await runRead(args.path, args.limit);
-    }
-    case "write_file": {
-      if (typeof args.path !== "string") return "Error: path required";
-      if (typeof args.content !== "string") return "Error: content required";
-      return await runWrite(args.path, args.content);
-    }
-    case "edit_file": {
-      if (typeof args.path !== "string") return "Error: path required";
-      if (typeof args.old_text !== "string") return "Error: old_text required";
-      if (typeof args.new_text !== "string") return "Error: new_text required";
-      return await runEdit(args.path, args.old_text, args.new_text);
-    }
-    case "todo":
-      return TODO.update(args.items);
-    default:
-      return `Unknown tool: ${name}`;
+function getStringArg(args: ToolArgs, name: string): string {
+  const value = args[name];
+  if (typeof value !== "string") {
+    throw new Error(`Missing or invalid string argument: ${name}`);
   }
+  return value;
+}
+
+function getOptionalNumberArg(args: ToolArgs, name: string): number | undefined {
+  const value = args[name];
+  if (value === undefined) return undefined;
+  if (typeof value !== "number") {
+    throw new Error(`Invalid number argument: ${name}`);
+  }
+  return value;
+}
+
+const TOOL_HANDLERS: Record<string, ToolHandler> = {
+  bash: (args) => runBash(getStringArg(args, "command")),
+  read_file: (args) =>
+    runRead(getStringArg(args, "path"), getOptionalNumberArg(args, "limit")),
+  write_file: (args) =>
+    runWrite(getStringArg(args, "path"), getStringArg(args, "content")),
+  edit_file: (args) =>
+    runEdit(
+      getStringArg(args, "path"),
+      getStringArg(args, "old_text"),
+      getStringArg(args, "new_text"),
+    ),
+  load_skill: (args) => SKILL_REGISTRY.loadFullText(getStringArg(args, "name")),
+};
+
+function objectSchema(
+  properties: Record<string, JsonSchema>,
+  required: string[],
+): JsonSchema {
+  return {
+    type: "object",
+    properties,
+    required,
+    additionalProperties: false,
+  };
+}
+
+function tool(
+  name: string,
+  description: string,
+  parameters: JsonSchema,
+): OpenAI.Chat.ChatCompletionTool {
+  return {
+    type: "function",
+    function: {
+      name,
+      description,
+      parameters,
+    },
+  };
 }
 
 const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
-  {
-    type: "function",
-    function: {
-      name: "bash",
-      description: "Run a shell command.",
-      parameters: {
-        type: "object",
-        properties: { command: { type: "string" } },
-        required: ["command"],
+  tool(
+    "bash",
+    "Run a shell command.",
+    objectSchema(
+      {
+        command: { type: "string" },
       },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "read_file",
-      description: "Read file contents.",
-      parameters: {
-        type: "object",
-        properties: {
-          path: { type: "string" },
-          limit: { type: "integer" },
-        },
-        required: ["path"],
+      ["command"],
+    ),
+  ),
+  tool(
+    "read_file",
+    "Read file contents.",
+    objectSchema(
+      {
+        path: { type: "string" },
+        limit: { type: "integer" },
       },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "write_file",
-      description: "Write content to a file.",
-      parameters: {
-        type: "object",
-        properties: {
-          path: { type: "string" },
-          content: { type: "string" },
-        },
-        required: ["path", "content"],
+      ["path"],
+    ),
+  ),
+  tool(
+    "write_file",
+    "Write content to a file.",
+    objectSchema(
+      {
+        path: { type: "string" },
+        content: { type: "string" },
       },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "edit_file",
-      description: "Replace exact text in a file once.",
-      parameters: {
-        type: "object",
-        properties: {
-          path: { type: "string" },
-          old_text: { type: "string" },
-          new_text: { type: "string" },
-        },
-        required: ["path", "old_text", "new_text"],
+      ["path", "content"],
+    ),
+  ),
+  tool(
+    "edit_file",
+    "Replace exact text in a file once.",
+    objectSchema(
+      {
+        path: { type: "string" },
+        old_text: { type: "string" },
+        new_text: { type: "string" },
       },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "todo",
-      description: "Rewrite the current session plan for multi-step work.",
-      parameters: {
-        type: "object",
-        properties: {
-          items: {
-            type: "array",
-            items: {
-              type: "object",
-              properties: {
-                content: { type: "string" },
-                status: {
-                  type: "string",
-                  enum: ["pending", "in_progress", "completed"],
-                },
-                activeForm: {
-                  type: "string",
-                  description: "Optional present-continuous label.",
-                },
-              },
-              required: ["content", "status"],
-            },
-          },
-        },
-        required: ["items"],
+      ["path", "old_text", "new_text"],
+    ),
+  ),
+  tool(
+    "load_skill",
+    "Load the full body of a named skill into the current context.",
+    objectSchema(
+      {
+        name: { type: "string" },
       },
-    },
-  },
+      ["name"],
+    ),
+  ),
 ];
 
-function extractText(message: OpenAI.Chat.ChatCompletionMessageParam | undefined): string {
-  if (!message || message.role !== "assistant") return "";
-  const content = message.content;
-  if (typeof content === "string") return content.trim();
-  if (!Array.isArray(content)) return "";
-  return content
-    .map((block) => (block.type === "text" ? block.text : ""))
-    .join("\n")
-    .trim();
+function parseToolArguments(rawArguments: string): ToolArgs {
+  try {
+    const parsed = JSON.parse(rawArguments);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+    return parsed as ToolArgs;
+  } catch {
+    return {};
+  }
 }
 
-function parseToolArguments(argumentsText: string): Record<string, unknown> {
-  const parsed = JSON.parse(argumentsText || "{}");
-  if (!isRecord(parsed)) {
-    throw new Error("Tool arguments must be a JSON object");
-  }
-  return parsed;
+function extractText(
+  content: OpenAI.Chat.ChatCompletionMessageParam["content"],
+): string {
+  if (typeof content === "string") return content.trim();
+  if (!Array.isArray(content)) return "";
+
+  return content
+    .map((part) => {
+      if (part.type === "text") return part.text;
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n")
+    .trim();
 }
 
 async function agentLoop(
@@ -369,9 +381,9 @@ async function agentLoop(
   while (true) {
     const response = await client.chat.completions.create({
       model: MODEL,
-      messages: [{ role: "system", content: SYSTEM }, ...messages],
+      messages: [{ role: "system", content: SYSTEM_PROMPT }, ...messages],
       tools: TOOLS,
-      max_completion_tokens: 8000,
+      max_tokens: 8000,
     });
 
     const assistantMessage = response.choices[0]?.message;
@@ -379,7 +391,7 @@ async function agentLoop(
 
     messages.push({
       role: "assistant",
-      content: assistantMessage.content ?? null,
+      content: assistantMessage.content,
       tool_calls: assistantMessage.tool_calls,
     });
 
@@ -388,71 +400,68 @@ async function agentLoop(
       return;
     }
 
-    let usedTodo = false;
     for (const toolCall of toolCalls) {
       if (toolCall.type !== "function") continue;
 
+      const name = toolCall.function.name;
+      const handler = TOOL_HANDLERS[name];
       let output: string;
+
       try {
-        output = await executeTool(
-          toolCall.function.name,
-          parseToolArguments(toolCall.function.arguments),
-        );
+        const args = parseToolArguments(toolCall.function.arguments);
+        output = handler ? await handler(args) : `Unknown tool: ${name}`;
       } catch (error) {
         output = `Error: ${error instanceof Error ? error.message : String(error)}`;
       }
 
-      console.log(`> ${toolCall.function.name}: ${output.slice(0, 200)}`);
+      console.log(`> ${name}: ${output.slice(0, 200)}`);
+
       messages.push({
         role: "tool",
         tool_call_id: toolCall.id,
         content: output,
       });
-
-      if (toolCall.function.name === "todo") {
-        usedTodo = true;
-      }
-    }
-
-    if (usedTodo) {
-      TODO.state.roundsSinceUpdate = 0;
-    } else {
-      TODO.noteRoundWithoutUpdate();
-      const reminder = TODO.reminder();
-      if (reminder) {
-        messages.push({ role: "user", content: reminder });
-      }
     }
   }
 }
 
 async function main(): Promise<void> {
   const history: OpenAI.Chat.ChatCompletionMessageParam[] = [];
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    prompt: "\x1b[36ms05 >> \x1b[0m",
+  });
 
-  while (true) {
-    let query: string;
-    try {
-      query = await rl.question("\x1b[36ms03 >> \x1b[0m");
-    } catch {
-      break;
-    }
+  rl.prompt();
 
-    if (["q", "exit", ""].includes(query.trim().toLowerCase())) {
-      break;
+  rl.on("line", async (query) => {
+    const trimmed = query.trim().toLowerCase();
+    if (trimmed === "q" || trimmed === "exit" || trimmed === "") {
+      rl.close();
+      return;
     }
 
     history.push({ role: "user", content: query });
-    await agentLoop(history);
 
-    const finalText = extractText(history.at(-1));
-    if (finalText) {
-      console.log(finalText);
+    try {
+      await agentLoop(history);
+      const finalText = extractText(history[history.length - 1]?.content);
+      if (finalText) console.log(finalText);
+      console.log();
+    } catch (error) {
+      console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
     }
-    console.log();
-  }
 
-  rl.close();
+    rl.prompt();
+  });
+
+  rl.on("close", () => {
+    process.exit(0);
+  });
 }
 
-await main();
+main().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});

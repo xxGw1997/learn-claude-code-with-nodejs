@@ -1,28 +1,36 @@
 import * as readline from "node:readline";
 import OpenAI from "openai";
+import { WORKDIR } from "./config";
 
 import { executeTool, TOOLS } from "./tools";
+import { SKILL_REGISTRY } from "./tools/skills";
 
 /*================  CONSTANT CONFIG  ===================*/
 
-export const WORKDIR = process.cwd();
 const client = new OpenAI({
   baseURL: Bun.env.BASE_URL!,
   apiKey: Bun.env.ANTHROPIC_API_KEY!,
 });
 const MODEL = Bun.env.MODEL_ID!;
 
-const SYSTEM_PROMPT = `You are a coding agent at ${WORKDIR}. Use tools to solve tasks. Act, don't explain.`;
+const SYSTEM_PROMPT = `You are a coding agent at ${WORKDIR}.
+Use load_skill when a task needs specialized instructions before you act.
+Skills available:
+${SKILL_REGISTRY.listAvailableSkills()}
+`;
 
 async function agentLoop(
   messages: OpenAI.Chat.ChatCompletionMessageParam[],
 ): Promise<void> {
   while (true) {
-    const response = await client.chat.completions.create({
+    const rawResponse = await client.chat.completions.create({
       model: MODEL!,
       messages: [{ role: "system", content: SYSTEM_PROMPT }, ...messages],
       tools: TOOLS,
     });
+
+    const response =
+      typeof rawResponse === "string" ? JSON.parse(rawResponse) : rawResponse;
 
     const choice = response.choices[0];
 
