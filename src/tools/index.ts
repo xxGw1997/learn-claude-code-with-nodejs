@@ -33,11 +33,18 @@ const EditFileArgsSchema = z
   })
   .strict();
 
+const CompactArgsSchema = z
+  .object({
+    focus: z.string().describe("Next focus on"),
+  })
+  .strict();
+
 const TOOL_SCHEMAS = {
   runBash: BashArgsSchema,
   runRead: ReadFileArgsSchema,
   runWrite: WriteFileArgsSchema,
   runEdit: EditFileArgsSchema,
+  compact: CompactArgsSchema,
 } as const;
 
 function safePath(pathStr: string): string {
@@ -157,6 +164,11 @@ export const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
   genTool("runRead", "Read file contents.", TOOL_SCHEMAS.runRead),
   genTool("runWrite", "Run a shell command.", TOOL_SCHEMAS.runWrite),
   genTool("runEdit", "Run a shell command.", TOOL_SCHEMAS.runEdit),
+  genTool(
+    "compact",
+    "Summarize earlier conversation so work can continue in a smaller context.",
+    TOOL_SCHEMAS.compact,
+  ),
 ];
 
 export async function executeTool(
@@ -197,6 +209,13 @@ export async function executeTool(
         parsed.data.new_text,
       );
     }
+    case "compact": {
+      const parsed = TOOL_SCHEMAS.compact.safeParse(args);
+      if (!parsed.success)
+        return `Error: Invalid arguments for ${name}: ${parsed.error.message}`;
+      return "Compacting conversation...";
+    }
+
     default:
       return `Unknown tool: ${name}`;
   }
