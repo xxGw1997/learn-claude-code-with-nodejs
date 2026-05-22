@@ -1,4 +1,4 @@
-import * as readline from "node:readline";
+﻿import * as readline from "node:readline/promises";
 import OpenAI from "openai";
 
 import { executeTool, TOOLS } from "./tools";
@@ -35,8 +35,6 @@ async function agentLoop(
       content: assistantMessage.content,
       tool_calls: assistantMessage.tool_calls,
     });
-
-    // 如果返回的内容不是工具调用 或 工具调用是空的 -> 则当作正常回答，本轮问答结束
     if (
       choice.finish_reason !== "tool_calls" ||
       !assistantMessage.tool_calls ||
@@ -65,42 +63,39 @@ async function agentLoop(
   }
 }
 
+
 async function main() {
   const history: OpenAI.Chat.ChatCompletionMessageParam[] = [];
 
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
-    prompt: "🧐: \x1b[0m ",
   });
 
-  rl.prompt();
+  try {
+    while (true) {
+      const query = await rl.question("> ");
+      const queryTrim = query.trim().toLowerCase();
 
-  rl.on("line", async (query: string) => {
-    const queryTrim = query.trim().toLowerCase();
+      if (["exit", "q"].includes(queryTrim)) {
+        console.log("bye~");
+        break;
+      }
 
-    if (["exit", "q"].includes(queryTrim)) {
-      console.log("bye~👋🏻");
-      rl.close();
-      return;
+      history.push({
+        role: "user",
+        content: query,
+      });
+
+      await agentLoop(history);
+
+      console.log();
+      console.log(history[history.length - 1]?.content);
+      console.log();
     }
-
-    history.push({
-      role: "user",
-      content: query,
-    });
-
-    await agentLoop(history);
-
-    console.log();
-    console.log(history[history.length - 1]?.content);
-    console.log();
-    rl.prompt();
-  });
-
-  rl.on("close", () => {
-    process.exit(0);
-  });
+  } finally {
+    rl.close();
+  }
 }
 
 main();

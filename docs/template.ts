@@ -1,258 +1,344 @@
 #!/usr/bin/env bun
-/**
- * s03_todo_write.ts - Session Planning with TodoWrite
- * This chapter is about a lightweight session plan, not a durable task graph.
- * The model can rewrite its current plan, keep one active step in focus, and get
- * nudged if it stops refreshing the plan for too many rounds.
+// Harness: safety -- the pipeline between intent and execution.
+/*
+ * s07_permission_system.ts - Permission System
+ *
+ * Every tool call passes through a permission pipeline before execution.
+ *
+ * Teaching pipeline:
+ *   1. deny rules
+ *   2. mode check
+ *   3. allow rules
+ *   4. ask user
+ *
+ * This version intentionally teaches three modes first:
+ *   - default
+ *   - plan
+ *   - auto
+ *
+ * Key insight: "Safety is a pipeline, not a boolean."
  */
-import OpenAI from "openai";
+
+import { spawn } from "node:child_process";
+import * as fs from "node:fs";
 import * as path from "node:path";
-import { mkdir } from "node:fs/promises";
 import * as readline from "node:readline/promises";
+import { stdin as input, stdout as output } from "node:process";
+import OpenAI from "openai";
+import type { ChatCompletionMessageParam, ChatCompletionTool } from "openai/resources/chat/completions";
 
 const WORKDIR = process.cwd();
+
 const client = new OpenAI({
-  baseURL: Bun.env.BASE_URL ?? Bun.env.OPENAI_BASE_URL ?? Bun.env.ANTHROPIC_BASE_URL,
-  apiKey:
-    Bun.env.OPENAI_API_KEY ??
-    Bun.env.ANTHROPIC_API_KEY ??
-    Bun.env.ANTHROPIC_AUTH_TOKEN ??
-    "not-needed",
+  apiKey: Bun.env.OPENAI_API_KEY ?? Bun.env.API_KEY ?? Bun.env.ANTHROPIC_API_KEY,
+  baseURL: Bun.env.OPENAI_BASE_URL ?? Bun.env.BASE_URL,
 });
-const MODEL = Bun.env.MODEL_ID!;
-const PLAN_REMINDER_INTERVAL = 3;
-const SYSTEM = `You are a coding agent at ${WORKDIR}.
-Use the todo tool for multi-step work.
-Keep exactly one step in_progress when a task has multiple steps.
-Refresh the plan as work advances. Prefer tools over prose.`;
 
-type PlanStatus = "pending" | "in_progress" | "completed";
+const MODEL = Bun.env.MODEL_ID ?? "gpt-4.1-mini";
 
-type PlanItem = {
-  content: string;
-  status: PlanStatus;
-  activeForm: string;
+// -- Permission modes --
+
+const MODES = ["default", "plan", "auto"] as const;
+type PermissionMode = (typeof MODES)[number];
+type PermissionBehavior = "allow" | "deny" | "ask";
+
+const READ_ONLY_TOOLS = new Set(["read_file", "bash_readonly"]);
+const WRITE_TOOLS = new Set(["write_file", "edit_file", "bash"]);
+
+type ToolInput = Record<string, unknown>;
+
+type PermissionRule = {
+  tool: string;
+  path?: string;
+  content?: string;
+  behavior: PermissionBehavior;
 };
 
-type PlanningState = {
-  items: PlanItem[];
-  roundsSinceUpdate: number;
-};
+// -- Bash security validation --
 
-class TodoManager {
-  state: PlanningState = { items: [], roundsSinceUpdate: 0 };
+class BashSecurityValidator {
+  private readonly validators: Array<[string, RegExp]> = [
+    ["shell_metachar", /[;&|`$]/],
+    ["sudo", /\bsudo\b/],
+    ["rm_rf", /\brm\s+(-[a-zA-Z]*)?r/],
+    ["cmd_substitution", /\$\(/],
+    ["ifs_injection", /\bIFS\s*=/],
+  ];
 
-  update(items: unknown): string {
-    if (!Array.isArray(items)) {
-      throw new Error("items must be an array");
-    }
-    if (items.length > 12) {
-      throw new Error("Keep the session plan short (max 12 items)");
-    }
+  validate(command: string): Array<[string, string]> {
+    const failures: Array<[string, string]> = [];
 
-    const normalized: PlanItem[] = [];
-    let inProgressCount = 0;
-
-    items.forEach((rawItem, index) => {
-      if (!isRecord(rawItem)) {
-        throw new Error(`Item ${index}: object required`);
+    for (const [name, pattern] of this.validators) {
+      if (pattern.test(command)) {
+        failures.push([name, pattern.source]);
       }
-
-      const content = String(rawItem.content ?? "").trim();
-      const status = String(rawItem.status ?? "pending").toLowerCase();
-      const activeForm = String(rawItem.activeForm ?? "").trim();
-
-      if (!content) {
-        throw new Error(`Item ${index}: content required`);
-      }
-      if (!isPlanStatus(status)) {
-        throw new Error(`Item ${index}: invalid status '${status}'`);
-      }
-      if (status === "in_progress") {
-        inProgressCount += 1;
-      }
-
-      normalized.push({ content, status, activeForm });
-    });
-
-    if (inProgressCount > 1) {
-      throw new Error("Only one plan item can be in_progress");
     }
 
-    this.state.items = normalized;
-    this.state.roundsSinceUpdate = 0;
-    return this.render();
+    return failures;
   }
 
-  noteRoundWithoutUpdate(): void {
-    this.state.roundsSinceUpdate += 1;
+  isSafe(command: string): boolean {
+    return this.validate(command).length === 0;
   }
 
-  reminder(): string | null {
-    if (this.state.items.length === 0) return null;
-    if (this.state.roundsSinceUpdate < PLAN_REMINDER_INTERVAL) return null;
-    return "<reminder>Refresh your current plan before continuing.</reminder>";
-  }
+  describeFailures(command: string): string {
+    const failures = this.validate(command);
 
-  render(): string {
-    if (this.state.items.length === 0) {
-      return "No session plan yet.";
+    if (failures.length === 0) {
+      return "No issues detected";
     }
 
-    const lines = this.state.items.map((item) => {
-      const marker = {
-        pending: "[ ]",
-        in_progress: "[>]",
-        completed: "[x]",
-      }[item.status];
-      let line = `${marker} ${item.content}`;
-      if (item.status === "in_progress" && item.activeForm) {
-        line += ` (${item.activeForm})`;
-      }
-      return line;
-    });
-
-    const completed = this.state.items.filter(
-      (item) => item.status === "completed",
-    ).length;
-    lines.push(`\n(${completed}/${this.state.items.length} completed)`);
-    return lines.join("\n");
+    return `Security flags: ${failures
+      .map(([name, pattern]) => `${name} (pattern: ${pattern})`)
+      .join(", ")}`;
   }
 }
 
-const TODO = new TodoManager();
+// -- Workspace trust --
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+function isWorkspaceTrusted(workspace = WORKDIR): boolean {
+  const trustMarker = path.join(workspace, ".claude", ".claude_trusted");
+  return fs.existsSync(trustMarker);
 }
 
-function isPlanStatus(value: string): value is PlanStatus {
-  return value === "pending" || value === "in_progress" || value === "completed";
+const bashValidator = new BashSecurityValidator();
+
+// -- Permission rules --
+
+const DEFAULT_RULES: PermissionRule[] = [
+  { tool: "bash", content: "rm -rf /", behavior: "deny" },
+  { tool: "bash", content: "sudo *", behavior: "deny" },
+  { tool: "read_file", path: "*", behavior: "allow" },
+];
+
+class PermissionManager {
+  mode: PermissionMode;
+  rules: PermissionRule[];
+  consecutiveDenials = 0;
+  maxConsecutiveDenials = 3;
+
+  constructor(mode: PermissionMode = "default", rules: PermissionRule[] = DEFAULT_RULES) {
+    if (!MODES.includes(mode)) {
+      throw new Error(`Unknown mode: ${mode}. Choose from ${MODES.join(", ")}`);
+    }
+
+    this.mode = mode;
+    this.rules = [...rules];
+  }
+
+  check(toolName: string, toolInput: ToolInput): { behavior: PermissionBehavior; reason: string } {
+    if (toolName === "bash") {
+      const command = String(toolInput.command ?? "");
+      const failures = bashValidator.validate(command);
+
+      if (failures.length > 0) {
+        const severe = new Set(["sudo", "rm_rf"]);
+        const severeHits = failures.filter(([name]) => severe.has(name));
+        const desc = bashValidator.describeFailures(command);
+
+        if (severeHits.length > 0) {
+          return { behavior: "deny", reason: `Bash validator: ${desc}` };
+        }
+
+        return { behavior: "ask", reason: `Bash validator flagged: ${desc}` };
+      }
+    }
+
+    for (const rule of this.rules) {
+      if (rule.behavior === "deny" && this.matches(rule, toolName, toolInput)) {
+        return { behavior: "deny", reason: `Blocked by deny rule: ${JSON.stringify(rule)}` };
+      }
+    }
+
+    if (this.mode === "plan") {
+      if (WRITE_TOOLS.has(toolName)) {
+        return { behavior: "deny", reason: "Plan mode: write operations are blocked" };
+      }
+
+      return { behavior: "allow", reason: "Plan mode: read-only allowed" };
+    }
+
+    if (this.mode === "auto" && READ_ONLY_TOOLS.has(toolName)) {
+      return { behavior: "allow", reason: "Auto mode: read-only tool auto-approved" };
+    }
+
+    for (const rule of this.rules) {
+      if (rule.behavior === "allow" && this.matches(rule, toolName, toolInput)) {
+        this.consecutiveDenials = 0;
+        return { behavior: "allow", reason: `Matched allow rule: ${JSON.stringify(rule)}` };
+      }
+    }
+
+    return { behavior: "ask", reason: `No rule matched for ${toolName}, asking user` };
+  }
+
+  async askUser(rl: readline.Interface, toolName: string, toolInput: ToolInput): Promise<boolean> {
+    const preview = JSON.stringify(toolInput).slice(0, 200);
+    console.log(`\n  [Permission] ${toolName}: ${preview}`);
+
+    let answer = "";
+    try {
+      answer = (await rl.question("  Allow? (y/n/always): ")).trim().toLowerCase();
+    } catch {
+      return false;
+    }
+
+    if (answer === "always") {
+      this.rules.push({ tool: toolName, path: "*", behavior: "allow" });
+      this.consecutiveDenials = 0;
+      return true;
+    }
+
+    if (answer === "y" || answer === "yes") {
+      this.consecutiveDenials = 0;
+      return true;
+    }
+
+    this.consecutiveDenials += 1;
+    if (this.consecutiveDenials >= this.maxConsecutiveDenials) {
+      console.log(`  [${this.consecutiveDenials} consecutive denials -- consider switching to plan mode]`);
+    }
+
+    return false;
+  }
+
+  private matches(rule: PermissionRule, toolName: string, toolInput: ToolInput): boolean {
+    if (rule.tool !== "*" && rule.tool !== toolName) {
+      return false;
+    }
+
+    if (rule.path && rule.path !== "*") {
+      const inputPath = String(toolInput.path ?? "");
+      if (!globMatch(inputPath, rule.path)) {
+        return false;
+      }
+    }
+
+    if (rule.content) {
+      const command = String(toolInput.command ?? "");
+      if (!globMatch(command, rule.content)) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+}
+
+// -- Tool implementations --
+
+function globMatch(value: string, pattern: string): boolean {
+  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
+  return new RegExp(`^${escaped}$`).test(value);
 }
 
 function safePath(pathStr: string): string {
-  const resolved = path.resolve(WORKDIR, pathStr);
-  const relative = path.relative(WORKDIR, resolved);
+  const resolvedPath = path.resolve(WORKDIR, pathStr);
+  const relative = path.relative(WORKDIR, resolvedPath);
+
   if (relative.startsWith("..") || path.isAbsolute(relative)) {
     throw new Error(`Path escapes workspace: ${pathStr}`);
   }
-  return resolved;
+
+  return resolvedPath;
 }
 
 async function runBash(command: string): Promise<string> {
-  const dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"];
-  if (dangerous.some((item) => command.includes(item))) {
-    return "Error: Dangerous command blocked";
-  }
-
-  try {
-    const proc = Bun.spawn(["bash", "-lc", command], {
+  return await new Promise((resolve) => {
+    const child = spawn(command, {
+      shell: true,
       cwd: WORKDIR,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const stdout = new Response(proc.stdout).text();
-    const stderr = new Response(proc.stderr).text();
-
-    let timeout: Timer | undefined;
-    const timedOut = new Promise<"timeout">((resolve) => {
-      timeout = setTimeout(() => {
-        proc.kill();
-        resolve("timeout");
-      }, 120_000);
+      timeout: 120_000,
     });
 
-    const exit = await Promise.race([proc.exited, timedOut]);
-    if (timeout) clearTimeout(timeout);
-    if (exit === "timeout") {
-      await Promise.allSettled([stdout, stderr]);
-      return "Error: Timeout (120s)";
-    }
+    let stdout = "";
+    let stderr = "";
 
-    const output = ((await stdout) + (await stderr)).trim();
-    return output ? output.slice(0, 50_000) : "(no output)";
-  } catch (error) {
-    return `Error: ${error instanceof Error ? error.message : String(error)}`;
-  }
+    child.stdout?.on("data", (data) => {
+      stdout += data.toString();
+    });
+
+    child.stderr?.on("data", (data) => {
+      stderr += data.toString();
+    });
+
+    child.on("close", () => {
+      const result = (stdout + stderr).trim();
+      resolve(result ? result.slice(0, 50_000) : "(no output)");
+    });
+
+    child.on("error", (err) => {
+      resolve(`Error: ${err.message}`);
+    });
+  });
 }
 
-async function runRead(filePath: string, limit?: number): Promise<string> {
+function runRead(filePath: string, limit?: number): string {
   try {
-    const content = await Bun.file(safePath(filePath)).text();
-    let lines = content.length === 0 ? [] : content.split(/\r?\n/);
+    const lines = fs.readFileSync(safePath(filePath), "utf-8").split(/\r?\n/);
+
     if (limit && limit < lines.length) {
-      lines = lines.slice(0, limit).concat(`... (${lines.length - limit} more lines)`);
+      const remaining = lines.length - limit;
+      return [...lines.slice(0, limit), `... (${remaining} more)`].join("\n").slice(0, 50_000);
     }
+
     return lines.join("\n").slice(0, 50_000);
-  } catch (error) {
-    return `Error: ${error instanceof Error ? error.message : String(error)}`;
+  } catch (err) {
+    return `Error: ${err instanceof Error ? err.message : String(err)}`;
   }
 }
 
-async function runWrite(filePath: string, content: string): Promise<string> {
+function runWrite(filePath: string, content: string): string {
   try {
-    const resolved = safePath(filePath);
-    await mkdir(path.dirname(resolved), { recursive: true });
-    await Bun.write(resolved, content);
-    return `Wrote ${content.length} bytes to ${filePath}`;
-  } catch (error) {
-    return `Error: ${error instanceof Error ? error.message : String(error)}`;
+    const fullPath = safePath(filePath);
+    fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+    fs.writeFileSync(fullPath, content);
+    return `Wrote ${content.length} bytes`;
+  } catch (err) {
+    return `Error: ${err instanceof Error ? err.message : String(err)}`;
   }
 }
 
-async function runEdit(
-  filePath: string,
-  oldText: string,
-  newText: string,
-): Promise<string> {
+function runEdit(filePath: string, oldText: string, newText: string): string {
   try {
-    const resolved = safePath(filePath);
-    const content = await Bun.file(resolved).text();
+    const fullPath = safePath(filePath);
+    const content = fs.readFileSync(fullPath, "utf-8");
+
     if (!content.includes(oldText)) {
       return `Error: Text not found in ${filePath}`;
     }
-    await Bun.write(resolved, content.replace(oldText, newText));
+
+    fs.writeFileSync(fullPath, content.replace(oldText, newText));
     return `Edited ${filePath}`;
-  } catch (error) {
-    return `Error: ${error instanceof Error ? error.message : String(error)}`;
+  } catch (err) {
+    return `Error: ${err instanceof Error ? err.message : String(err)}`;
   }
 }
 
-async function executeTool(
-  name: string,
-  args: Record<string, unknown>,
-): Promise<string> {
+async function executeTool(name: string, inputData: ToolInput): Promise<string> {
   switch (name) {
-    case "bash": {
-      if (typeof args.command !== "string") return "Error: command required";
-      return await runBash(args.command);
-    }
-    case "read_file": {
-      if (typeof args.path !== "string") return "Error: path required";
-      if (args.limit !== undefined && typeof args.limit !== "number") {
-        return "Error: limit must be a number";
-      }
-      return await runRead(args.path, args.limit);
-    }
-    case "write_file": {
-      if (typeof args.path !== "string") return "Error: path required";
-      if (typeof args.content !== "string") return "Error: content required";
-      return await runWrite(args.path, args.content);
-    }
-    case "edit_file": {
-      if (typeof args.path !== "string") return "Error: path required";
-      if (typeof args.old_text !== "string") return "Error: old_text required";
-      if (typeof args.new_text !== "string") return "Error: new_text required";
-      return await runEdit(args.path, args.old_text, args.new_text);
-    }
-    case "todo":
-      return TODO.update(args.items);
+    case "bash":
+      return await runBash(String(inputData.command ?? ""));
+    case "read_file":
+      return runRead(String(inputData.path ?? ""), asOptionalNumber(inputData.limit));
+    case "write_file":
+      return runWrite(String(inputData.path ?? ""), String(inputData.content ?? ""));
+    case "edit_file":
+      return runEdit(
+        String(inputData.path ?? ""),
+        String(inputData.old_text ?? ""),
+        String(inputData.new_text ?? ""),
+      );
     default:
-      return `Unknown tool: ${name}`;
+      return `Unknown: ${name}`;
   }
 }
 
-const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
+function asOptionalNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+const TOOLS: ChatCompletionTool[] = [
   {
     type: "function",
     function: {
@@ -260,8 +346,11 @@ const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
       description: "Run a shell command.",
       parameters: {
         type: "object",
-        properties: { command: { type: "string" } },
+        properties: {
+          command: { type: "string" },
+        },
         required: ["command"],
+        additionalProperties: false,
       },
     },
   },
@@ -277,6 +366,7 @@ const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
           limit: { type: "integer" },
         },
         required: ["path"],
+        additionalProperties: false,
       },
     },
   },
@@ -284,7 +374,7 @@ const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
     type: "function",
     function: {
       name: "write_file",
-      description: "Write content to a file.",
+      description: "Write content to file.",
       parameters: {
         type: "object",
         properties: {
@@ -292,6 +382,7 @@ const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
           content: { type: "string" },
         },
         required: ["path", "content"],
+        additionalProperties: false,
       },
     },
   },
@@ -299,7 +390,7 @@ const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
     type: "function",
     function: {
       name: "edit_file",
-      description: "Replace exact text in a file once.",
+      description: "Replace exact text in file.",
       parameters: {
         type: "object",
         properties: {
@@ -308,147 +399,135 @@ const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
           new_text: { type: "string" },
         },
         required: ["path", "old_text", "new_text"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "todo",
-      description: "Rewrite the current session plan for multi-step work.",
-      parameters: {
-        type: "object",
-        properties: {
-          items: {
-            type: "array",
-            items: {
-              type: "object",
-              properties: {
-                content: { type: "string" },
-                status: {
-                  type: "string",
-                  enum: ["pending", "in_progress", "completed"],
-                },
-                activeForm: {
-                  type: "string",
-                  description: "Optional present-continuous label.",
-                },
-              },
-              required: ["content", "status"],
-            },
-          },
-        },
-        required: ["items"],
+        additionalProperties: false,
       },
     },
   },
 ];
 
-function extractText(message: OpenAI.Chat.ChatCompletionMessageParam | undefined): string {
-  if (!message || message.role !== "assistant") return "";
-  const content = message.content;
-  if (typeof content === "string") return content.trim();
-  if (!Array.isArray(content)) return "";
-  return content
-    .map((block) => (block.type === "text" ? block.text : ""))
-    .join("\n")
-    .trim();
-}
-
-function parseToolArguments(argumentsText: string): Record<string, unknown> {
-  const parsed = JSON.parse(argumentsText || "{}");
-  if (!isRecord(parsed)) {
-    throw new Error("Tool arguments must be a JSON object");
-  }
-  return parsed;
-}
+const SYSTEM = `You are a coding agent at ${WORKDIR}. Use tools to solve tasks.
+The user controls permissions. Some tool calls may be denied.`;
 
 async function agentLoop(
-  messages: OpenAI.Chat.ChatCompletionMessageParam[],
+  messages: ChatCompletionMessageParam[],
+  perms: PermissionManager,
+  rl: readline.Interface,
 ): Promise<void> {
   while (true) {
     const response = await client.chat.completions.create({
       model: MODEL,
       messages: [{ role: "system", content: SYSTEM }, ...messages],
       tools: TOOLS,
-      max_completion_tokens: 8000,
+      max_tokens: 8000,
     });
 
-    const assistantMessage = response.choices[0]?.message;
-    if (!assistantMessage) return;
-
-    messages.push({
-      role: "assistant",
-      content: assistantMessage.content ?? null,
-      tool_calls: assistantMessage.tool_calls,
-    });
-
-    const toolCalls = assistantMessage.tool_calls ?? [];
-    if (response.choices[0]?.finish_reason !== "tool_calls" || toolCalls.length === 0) {
+    const message = response.choices[0]?.message;
+    if (!message) {
       return;
     }
 
-    let usedTodo = false;
-    for (const toolCall of toolCalls) {
-      if (toolCall.type !== "function") continue;
+    messages.push({
+      role: "assistant",
+      content: message.content ?? null,
+      tool_calls: message.tool_calls,
+    });
 
-      let output: string;
-      try {
-        output = await executeTool(
-          toolCall.function.name,
-          parseToolArguments(toolCall.function.arguments),
-        );
-      } catch (error) {
-        output = `Error: ${error instanceof Error ? error.message : String(error)}`;
+    if (!message.tool_calls || message.tool_calls.length === 0) {
+      return;
+    }
+
+    for (const toolCall of message.tool_calls) {
+      if (toolCall.type !== "function") {
+        continue;
       }
 
-      console.log(`> ${toolCall.function.name}: ${output.slice(0, 200)}`);
+      const toolName = toolCall.function.name;
+      const toolInput = parseToolArguments(toolCall.function.arguments);
+      const decision = perms.check(toolName, toolInput);
+      let toolOutput: string;
+
+      if (decision.behavior === "deny") {
+        toolOutput = `Permission denied: ${decision.reason}`;
+        console.log(`  [DENIED] ${toolName}: ${decision.reason}`);
+      } else if (decision.behavior === "ask") {
+        if (await perms.askUser(rl, toolName, toolInput)) {
+          toolOutput = await executeTool(toolName, toolInput);
+          console.log(`> ${toolName}: ${toolOutput.slice(0, 200)}`);
+        } else {
+          toolOutput = `Permission denied by user for ${toolName}`;
+          console.log(`  [USER DENIED] ${toolName}`);
+        }
+      } else {
+        toolOutput = await executeTool(toolName, toolInput);
+        console.log(`> ${toolName}: ${toolOutput.slice(0, 200)}`);
+      }
+
       messages.push({
         role: "tool",
         tool_call_id: toolCall.id,
-        content: output,
+        content: toolOutput,
       });
-
-      if (toolCall.function.name === "todo") {
-        usedTodo = true;
-      }
-    }
-
-    if (usedTodo) {
-      TODO.state.roundsSinceUpdate = 0;
-    } else {
-      TODO.noteRoundWithoutUpdate();
-      const reminder = TODO.reminder();
-      if (reminder) {
-        messages.push({ role: "user", content: reminder });
-      }
     }
   }
 }
 
+function parseToolArguments(rawArguments: string): ToolInput {
+  try {
+    const parsed = JSON.parse(rawArguments);
+    return typeof parsed === "object" && parsed !== null ? parsed as ToolInput : {};
+  } catch {
+    return {};
+  }
+}
+
 async function main(): Promise<void> {
-  const history: OpenAI.Chat.ChatCompletionMessageParam[] = [];
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const rl = readline.createInterface({ input, output });
+
+  console.log("Permission modes: default, plan, auto");
+  const modeInput = (await rl.question("Mode (default): ")).trim().toLowerCase();
+  const mode = MODES.includes(modeInput as PermissionMode) ? modeInput as PermissionMode : "default";
+  const perms = new PermissionManager(mode);
+  const history: ChatCompletionMessageParam[] = [];
+
+  console.log(`[Permission mode: ${mode}]`);
+  console.log(`[Workspace trusted: ${isWorkspaceTrusted() ? "yes" : "no"}]`);
 
   while (true) {
-    let query: string;
-    try {
-      query = await rl.question("\x1b[36ms03 >> \x1b[0m");
-    } catch {
+    const query = await rl.question("\x1b[36ms07 >> \x1b[0m");
+    const trimmed = query.trim();
+
+    if (["q", "exit", ""].includes(trimmed.toLowerCase())) {
       break;
     }
 
-    if (["q", "exit", ""].includes(query.trim().toLowerCase())) {
-      break;
+    if (trimmed.startsWith("/mode")) {
+      const [, nextMode] = trimmed.split(/\s+/);
+
+      if (MODES.includes(nextMode as PermissionMode)) {
+        perms.mode = nextMode as PermissionMode;
+        console.log(`[Switched to ${nextMode} mode]`);
+      } else {
+        console.log(`Usage: /mode <${MODES.join("|")}>`);
+      }
+
+      continue;
+    }
+
+    if (trimmed === "/rules") {
+      perms.rules.forEach((rule, index) => {
+        console.log(`  ${index}: ${JSON.stringify(rule)}`);
+      });
+      continue;
     }
 
     history.push({ role: "user", content: query });
-    await agentLoop(history);
+    await agentLoop(history, perms, rl);
 
-    const finalText = extractText(history.at(-1));
-    if (finalText) {
-      console.log(finalText);
+    const lastMessage = history[history.length - 1];
+    if (lastMessage && lastMessage.role === "assistant" && typeof lastMessage.content === "string") {
+      console.log(lastMessage.content);
     }
+
     console.log();
   }
 
